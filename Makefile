@@ -39,3 +39,7 @@ uninstall:
 
 debug: CFLAGS += -DDEBUG -Og
 debug: all
+
+test: all
+	@echo "Running basic tests..."
+	@sudo $(TARGET) lo
