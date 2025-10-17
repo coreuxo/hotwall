@@ -2,6 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include "filter.h"
+#include "../state/state.h"
+
+/* Add this global for state tracking integration */
+extern struct state_ctx *state_ctx;
 
 struct filter_ctx *filter_init(void) {
     struct filter_ctx *ctx;
@@ -26,9 +30,61 @@ void filter_cleanup(struct filter_ctx *ctx) {
     }
 }
 
+/* Enhanced rule matching with state tracking */
+int rule_match_enhanced(struct rule *rule, struct packet_info *pkt, struct conn_entry *conn) {
+    if (!rule || !pkt || !rule->enabled) {
+        return 0;
+    }
+    
+    /* check protocol */
+    if (rule->protocol != PROTO_ANY && rule->protocol != pkt->protocol) {
+        return 0;
+    }
+    
+    /* check source IP with network mask */
+    if (rule->src_mask != 0) {
+        uint32_t src_net = pkt->src_ip & rule->src_mask;
+        if (src_net != (rule->src_ip & rule->src_mask)) {
+            return 0;
+        }
+    }
+    
+    /* check destination IP with network mask */
+    if (rule->dst_mask != 0) {
+        uint32_t dst_net = pkt->dst_ip & rule->dst_mask;
+        if (dst_net != (rule->dst_ip & rule->dst_mask)) {
+            return 0;
+        }
+    }
+    
+    /* check source port range */
+    if (rule->src_port_start > 0) {
+        if (pkt->src_port < rule->src_port_start || pkt->src_port > rule->src_port_end) {
+            return 0;
+        }
+    }
+    
+    /* check destination port range */
+    if (rule->dst_port_start > 0) {
+        if (pkt->dst_port < rule->dst_port_start || pkt->dst_port > rule->dst_port_end) {
+            return 0;
+        }
+    }
+    
+    /* State-based matching for established connections */
+    if (conn && conn->state == CONN_STATE_ESTABLISHED) {
+        /* If we have an established connection, apply different logic */
+
+                                /* TODO: __|*/
+    }
+    
+    return 1;
+}
+
 int filter_packet(struct filter_ctx *ctx, struct packet_info *pkt) {
     struct rule_chain *chain;
     struct rule *current;
+    struct conn_entry *conn = NULL;
     int action = RULE_ACTION_ACCEPT; /* default accept */
     
     if (!ctx || !pkt) {
@@ -37,6 +93,11 @@ int filter_packet(struct filter_ctx *ctx, struct packet_info *pkt) {
     
     ctx->total_packets++;
     ctx->total_bytes += pkt->len;
+    
+    /* Get connection state if available */
+    if (state_ctx) {
+        conn = state_find_connection(state_ctx, pkt);
+    }
     
     /* determine which chain to use based on packet direction */
     switch (pkt->direction) {
@@ -49,7 +110,7 @@ int filter_packet(struct filter_ctx *ctx, struct packet_info *pkt) {
     /* walk through rules in the chain */
     current = chain->head;
     while (current) {
-        if (rule_match(current, pkt)) {
+        if (rule_match_enhanced(current, pkt, conn)) {
             action = current->action;
             current->packet_count++;
             current->byte_count += pkt->len;
@@ -59,11 +120,21 @@ int filter_packet(struct filter_ctx *ctx, struct packet_info *pkt) {
                 inet_ntop(AF_INET, &pkt->src_ip, src_ip, sizeof(src_ip));
                 inet_ntop(AF_INET, &pkt->dst_ip, dst_ip, sizeof(dst_ip));
                 
-                printf("RULE LOG: %s %s:%d -> %s:%d proto=%d action=%d\n",
+                const char *state_str = "NONE";
+                if (conn) {
+                    switch (conn->state) {
+                        case CONN_STATE_ESTABLISHED: state_str = "ESTABLISHED"; break;
+                        case CONN_STATE_SYN_SENT: state_str = "SYN_SENT"; break;
+                        case CONN_STATE_SYN_RECV: state_str = "SYN_RECV"; break;
+                        default: state_str = "OTHER"; break;
+                    }
+                }
+                
+                printf("RULE LOG: %s %s:%d -> %s:%d proto=%d action=%d state=%s\n",
                        protocol_str(pkt->protocol),
                        src_ip, pkt->src_port,
                        dst_ip, pkt->dst_port,
-                       pkt->protocol, action);
+                       pkt->protocol, action, state_str);
             }
             
             break;
@@ -80,6 +151,7 @@ int filter_packet(struct filter_ctx *ctx, struct packet_info *pkt) {
     return action;
 }
 
+/* Rest of the functions remain the same */
 int filter_add_rule(struct filter_ctx *ctx, uint8_t chain_type, struct rule *rule) {
     struct rule_chain *chain;
     struct rule new_rule;
