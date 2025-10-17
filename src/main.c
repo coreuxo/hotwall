@@ -3,6 +3,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include "firewall.h"
+#include "capture/capture.h"
 
 static volatile int running = 1;
 
@@ -13,6 +14,22 @@ void sig_handler(int sig) {
 void print_banner(void) {
     printf("Firewall v0.1 - starting up...\n");
     printf("PID: %d\n", getpid());
+}
+
+static int handle_packet(struct packet_info *pkt, void *user_data) {
+    /* just print basic info for now */
+    char src_ip[16], dst_ip[16];
+    
+    inet_ntop(AF_INET, &pkt->src_ip, src_ip, sizeof(src_ip));
+    inet_ntop(AF_INET, &pkt->dst_ip, dst_ip, sizeof(dst_ip));
+    
+    printf("%s %s:%d -> %s:%d proto=%d len=%d\n",
+           protocol_str(pkt->protocol),
+           src_ip, pkt->src_port,
+           dst_ip, pkt->dst_port,
+           pkt->protocol, pkt->len);
+    
+    return 0;
 }
 
 int main(int argc, char *argv[]) {
@@ -33,6 +50,14 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Failed to start firewall\n");
         firewall_cleanup(ctx);
         return 1;
+    }
+    
+    /* temp: test packet capture */
+    struct capture_ctx *cap = capture_init("eth0", 1, 1000);
+    if (cap) {
+        printf("Starting packet capture on eth0...\n");
+        capture_start(cap, handle_packet, NULL);
+        capture_cleanup(cap);
     }
     
     while (running) {
