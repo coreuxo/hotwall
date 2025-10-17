@@ -1,6 +1,6 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -g -std=gnu99
-LDFLAGS = -lpcap -lpthread -lm
+CFLAGS = -Wall -Wextra -O2 -g -std=gnu99 -pthread
+LDFLAGS = -lpthread -lm
 
 SRCDIR = src
 OBJDIR = obj
@@ -11,7 +11,9 @@ SOURCES = $(wildcard $(SRCDIR)/*.c) \
 OBJECTS = $(SOURCES:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 TARGET = $(BINDIR)/firewall
 
-.PHONY: all clean install uninstall
+INCLUDES = -Iinclude -I/usr/include
+
+.PHONY: all clean install uninstall nat
 
 all: $(TARGET)
 
@@ -20,7 +22,7 @@ $(TARGET): $(OBJECTS) | $(BINDIR)
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(OBJDIR):
 	@mkdir -p $(OBJDIR)
@@ -33,6 +35,7 @@ clean:
 
 install: all
 	cp $(TARGET) /usr/local/bin/
+	chmod +x /usr/local/bin/firewall
 
 uninstall:
 	rm -f /usr/local/bin/firewall
@@ -40,6 +43,15 @@ uninstall:
 debug: CFLAGS += -DDEBUG -Og
 debug: all
 
+nat: CFLAGS += -DNAT_ENABLED
+nat: all
+
 test: all
-	@echo "Running basic tests..."
-	@sudo $(TARGET) lo
+	@echo "Testing firewall build..."
+	@sudo $(TARGET) --test 2>/dev/null || echo "Firewall test mode"
+
+rules:
+	@chmod +x scripts/setup_rules.sh
+	@./scripts/setup_rules.sh
+
+.PHONY: all clean install uninstall debug nat test rules

@@ -3,11 +3,13 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 #include "firewall.h"
 #include "capture/capture.h"
 #include "capture/inject.h"
 #include "filter/filter.h"
 #include "state/state.h"
+#include "nat/nat.h"
 #include "log/log.h"
 
 struct firewall_ctx {
@@ -15,6 +17,7 @@ struct firewall_ctx {
     struct inject_ctx *inject;
     struct filter_ctx *filter;
     struct state_ctx *state;
+    struct nat_ctx *nat;
     struct log_ctx *logger;
     
     pthread_t capture_thread;
@@ -22,14 +25,219 @@ struct firewall_ctx {
     
     volatile int running;
     char iface[16];
+    uint32_t local_ip;
     
     uint64_t stats_total_packets;
     uint64_t stats_dropped_packets;
     uint64_t stats_rejected_packets;
     uint64_t stats_injected_packets;
+    uint64_t stats_nat_packets;
 };
 
 static struct firewall_ctx *g_ctx = NULL;
+
+static int is_local_ip(uint32_t ip) {
+    uint32_t local_nets[] = {
+        inet_addr("127.0.0.0"),
+        inet_addr("10.0.0.0"), 
+        inet_addr("192.168.0.0"),
+        inet_addr("172.16.0.0")
+    };
+    uint32_t local_masks[] = {
+        inet_addr("255.0.0.0"),
+        inet_addr("255.0.0.0"),
+        inet_addr("255.255.0.0"), 
+        inet_addr("255.240.0.0")
+    };
+    
+    for (int i = 0; i < 4; i++) {
+        if ((ip & local_masks[i]) == (local_nets[i] & local_masks[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int get_packet_direction(struct packet_info *pkt, uint32_t local_ip) {
+    int src_local = is_local_ip(pkt->src_ip);
+    int dst_local = is_local_ip(pkt->dst_ip);
+    
+    if (src_local && !dst_local) {
+        return 0;
+    } else if (!src_local && dst_local) {
+        return 1;
+    } else if (src_local && dst_local) {
+        if (pkt->src_ip == local_ip) return 0;
+        if (pkt->dst_ip == local_ip) return 1;
+        return 2;
+    } else {
+        return 2;
+    }
+}
+
+static void update_packet_checksums(struct packet_info *pkt) {
+    if (pkt->ip) {
+        pkt->ip->check = 0;
+        pkt->ip->check = checksum((uint16_t *)pkt->ip, pkt->ip->ihl * 4);
+    }
+    
+    if (pkt->tcp && pkt->ip) {
+        struct pseudo_header {
+            uint32_t src_ip;
+            uint32_t dst_ip;
+            uint8_t zero;
+            uint8_t protocol;
+            uint16_t tcp_len;
+        } pseudo;
+        
+        pseudo.src_ip = pkt->src_ip;
+        pseudo.dst_ip = pkt->dst_ip;
+        pseudo.zero = 0;
+        pseudo.protocol = IPPROTO_TCP;
+        pseudo.tcp_len = htons(sizeof(struct tcphdr) + pkt->payload_len);
+        
+        pkt->tcp->check = 0;
+        
+        uint32_t csum = 0;
+        uint16_t *ptr = (uint16_t *)&pseudo;
+        for (int i = 0; i < sizeof(pseudo)/2; i++) {
+            csum += *ptr++;
+        }
+        
+        ptr = (uint16_t *)pkt->tcp;
+        int tcp_words = (sizeof(struct tcphdr) + pkt->payload_len + 1) / 2;
+        for (int i = 0; i < tcp_words; i++) {
+            csum += *ptr++;
+        }
+        
+        csum = (csum >> 16) + (csum & 0xffff);
+        csum += (csum >> 16);
+        pkt->tcp->check = ~csum;
+    }
+    
+    if (pkt->udp && pkt->ip) {
+        struct pseudo_header {
+            uint32_t src_ip;
+            uint32_t dst_ip;
+            uint8_t zero;
+            uint8_t protocol;
+            uint16_t udp_len;
+        } pseudo;
+        
+        pseudo.src_ip = pkt->src_ip;
+        pseudo.dst_ip = pkt->dst_ip;
+        pseudo.zero = 0;
+        pseudo.protocol = IPPROTO_UDP;
+        pseudo.udp_len = htons(sizeof(struct udphdr) + pkt->payload_len);
+        
+        pkt->udp->check = 0;
+        
+        uint32_t csum = 0;
+        uint16_t *ptr = (uint16_t *)&pseudo;
+        for (int i = 0; i < sizeof(pseudo)/2; i++) {
+            csum += *ptr++;
+        }
+        
+        ptr = (uint16_t *)pkt->udp;
+        int udp_words = (sizeof(struct udphdr) + pkt->payload_len + 1) / 2;
+        for (int i = 0; i < udp_words; i++) {
+            csum += *ptr++;
+        }
+        
+        csum = (csum >> 16) + (csum & 0xffff);
+        csum += (csum >> 16);
+        pkt->udp->check = ~csum;
+    }
+}
+
+static int firewall_packet_handler(struct packet_info *pkt, void *user_data) {
+    struct firewall_ctx *ctx = (struct firewall_ctx *)user_data;
+    int action = RULE_ACTION_ACCEPT;
+    int direction;
+    int nat_applied = 0;
+    
+    if (!ctx || !pkt) return 1;
+    
+    ctx->stats_total_packets++;
+    
+    direction = get_packet_direction(pkt, ctx->local_ip);
+    pkt->direction = direction;
+    
+    if (ctx->nat) {
+        nat_applied = nat_process_packet(ctx->nat, pkt, direction);
+        if (nat_applied) {
+            ctx->stats_nat_packets++;
+            update_packet_checksums(pkt);
+        }
+    }
+    
+    if (ctx->state) {
+        state_process_packet(ctx->state, pkt);
+    }
+    
+    if (ctx->filter) {
+        action = filter_packet(ctx->filter, pkt);
+    }
+    
+    switch (action) {
+        case RULE_ACTION_ACCEPT:
+            if (nat_applied && ctx->inject) {
+                inject_packet(ctx->inject, pkt->data, pkt->len);
+                return 1;
+            }
+            break;
+            
+        case RULE_ACTION_DROP:
+            ctx->stats_dropped_packets++;
+            if (ctx->logger) {
+                char src_ip[16], dst_ip[16];
+                inet_ntop(AF_INET, &pkt->src_ip, src_ip, sizeof(src_ip));
+                inet_ntop(AF_INET, &pkt->dst_ip, dst_ip, sizeof(dst_ip));
+                log_msg(ctx->logger, LOG_LEVEL_INFO, "DROP %s %s:%d -> %s:%d proto=%d",
+                       protocol_str(pkt->protocol), src_ip, pkt->src_port, 
+                       dst_ip, pkt->dst_port, pkt->protocol);
+            }
+            return 1;
+            
+        case RULE_ACTION_REJECT:
+            ctx->stats_rejected_packets++;
+            if (ctx->inject) {
+                if (pkt->is_tcp && pkt->tcp) {
+                    inject_tcp_rst(ctx->inject, pkt->dst_ip, pkt->src_ip,
+                                  pkt->dst_port, pkt->src_port,
+                                  ntohl(pkt->tcp->ack_seq),
+                                  ntohl(pkt->tcp->seq) + 1);
+                    ctx->stats_injected_packets++;
+                } else {
+                    inject_icmp_unreach(ctx->inject, pkt->dst_ip, pkt->src_ip,
+                                       pkt->data, pkt->len, 3);
+                    ctx->stats_injected_packets++;
+                }
+            }
+            if (ctx->logger) {
+                char src_ip[16], dst_ip[16];
+                inet_ntop(AF_INET, &pkt->src_ip, src_ip, sizeof(src_ip));
+                inet_ntop(AF_INET, &pkt->dst_ip, dst_ip, sizeof(dst_ip));
+                log_msg(ctx->logger, LOG_LEVEL_INFO, "REJECT %s %s:%d -> %s:%d proto=%d",
+                       protocol_str(pkt->protocol), src_ip, pkt->src_port,
+                       dst_ip, pkt->dst_port, pkt->protocol);
+            }
+            return 1;
+            
+        case RULE_ACTION_LOG:
+            if (ctx->logger) {
+                char src_ip[16], dst_ip[16];
+                inet_ntop(AF_INET, &pkt->src_ip, src_ip, sizeof(src_ip));
+                inet_ntop(AF_INET, &pkt->dst_ip, dst_ip, sizeof(dst_ip));
+                log_msg(ctx->logger, LOG_LEVEL_INFO, "LOG %s %s:%d -> %s:%d proto=%d len=%d",
+                       protocol_str(pkt->protocol), src_ip, pkt->src_port,
+                       dst_ip, pkt->dst_port, pkt->protocol, pkt->len);
+            }
+            break;
+    }
+    
+    return 0;
+}
 
 static void *capture_thread_func(void *arg) {
     struct firewall_ctx *ctx = (struct firewall_ctx *)arg;
@@ -38,14 +246,10 @@ static void *capture_thread_func(void *arg) {
         return NULL;
     }
     
-    printf("Capture thread started on %s\n", ctx->iface);
+    printf("Packet capture running on %s\n", ctx->iface);
+    capture_start(ctx->capture, firewall_packet_handler, ctx);
+    printf("Packet capture stopped\n");
     
-    while (ctx->running) {
-        /* This would normally process packets */
-        usleep(100000); /* 100ms */
-    }
-    
-    printf("Capture thread stopped\n");
     return NULL;
 }
 
@@ -56,70 +260,17 @@ static void *cleanup_thread_func(void *arg) {
         return NULL;
     }
     
-    printf("Cleanup thread started\n");
-    
     while (ctx->running) {
         if (ctx->state) {
             state_cleanup_old(ctx->state);
         }
-        sleep(30); /* Cleanup every 30 seconds */
-    }
-    
-    printf("Cleanup thread stopped\n");
-    return NULL;
-}
-
-static int firewall_packet_handler(struct packet_info *pkt, void *user_data) {
-    struct firewall_ctx *ctx = (struct firewall_ctx *)user_data;
-    int action;
-    
-    if (!ctx || !pkt) {
-        return 0;
-    }
-    
-    ctx->stats_total_packets++;
-    
-    /* Process through state tracking */
-    if (ctx->state) {
-        state_process_packet(ctx->state, pkt);
-    }
-    
-    /* Process through filter engine */
-    if (ctx->filter) {
-        action = filter_packet(ctx->filter, pkt);
-        
-        switch (action) {
-            case RULE_ACTION_ACCEPT:
-                /* Packet is accepted, let it through */
-                break;
-                
-            case RULE_ACTION_DROP:
-                ctx->stats_dropped_packets++;
-                return 1; /* Drop packet */
-                
-            case RULE_ACTION_REJECT:
-                ctx->stats_rejected_packets++;
-                /* Send TCP RST or ICMP unreachable */
-                if (ctx->inject && pkt->is_tcp) {
-                    inject_tcp_rst(ctx->inject, pkt->dst_ip, pkt->src_ip,
-                                  pkt->dst_port, pkt->src_port, 
-                                  pkt->tcp ? ntohl(pkt->tcp->ack_seq) : 0,
-                                  pkt->tcp ? ntohl(pkt->tcp->seq) + 1 : 0);
-                    ctx->stats_injected_packets++;
-                } else if (ctx->inject) {
-                    inject_icmp_unreach(ctx->inject, pkt->dst_ip, pkt->src_ip,
-                                       pkt->data, pkt->len, 3); /* port unreachable */
-                    ctx->stats_injected_packets++;
-                }
-                return 1; /* Reject packet */
-                
-            case RULE_ACTION_LOG:
-                /* Log and accept */
-                break;
+        if (ctx->nat) {
+            nat_cleanup_old(ctx->nat);
         }
+        sleep(60);
     }
     
-    return 0; /* Accept packet */
+    return NULL;
 }
 
 struct firewall_ctx *firewall_init(void) {
@@ -135,13 +286,12 @@ struct firewall_ctx *firewall_init(void) {
     }
     
     memset(ctx, 0, sizeof(struct firewall_ctx));
-    
-    /* Default interface */
     strcpy(ctx->iface, "eth0");
+    ctx->local_ip = inet_addr("192.168.1.100");
     
-    /* Initialize components */
-    ctx->state = state_init(100000); /* 100k max connections */
+    ctx->state = state_init(100000);
     ctx->filter = filter_init();
+    ctx->nat = nat_init(inet_addr("1.2.3.4"));
     ctx->logger = log_init();
     
     if (!ctx->state || !ctx->filter) {
@@ -162,22 +312,16 @@ int firewall_start(struct firewall_ctx *ctx) {
         return -1;
     }
     
-    /* Initialize packet injection */
     ctx->inject = inject_init(ctx->iface);
-    if (!ctx->inject) {
-        fprintf(stderr, "Warning: Could not initialize packet injection\n");
-    }
-    
-    /* Initialize packet capture */
     ctx->capture = capture_init(ctx->iface, 1, 100);
+    
     if (!ctx->capture) {
-        fprintf(stderr, "Failed to initialize packet capture on %s\n", ctx->iface);
+        fprintf(stderr, "Failed to initialize packet capture\n");
         return -1;
     }
     
     ctx->running = 1;
     
-    /* Start capture thread */
     ret = pthread_create(&ctx->capture_thread, NULL, capture_thread_func, ctx);
     if (ret != 0) {
         fprintf(stderr, "Failed to create capture thread\n");
@@ -185,7 +329,6 @@ int firewall_start(struct firewall_ctx *ctx) {
         return -1;
     }
     
-    /* Start cleanup thread */
     ret = pthread_create(&ctx->cleanup_thread, NULL, cleanup_thread_func, ctx);
     if (ret != 0) {
         fprintf(stderr, "Failed to create cleanup thread\n");
@@ -194,7 +337,7 @@ int firewall_start(struct firewall_ctx *ctx) {
         return -1;
     }
     
-    printf("Firewall started successfully on %s\n", ctx->iface);
+    printf("Firewall engine started\n");
     return 0;
 }
 
@@ -207,11 +350,8 @@ void firewall_stop(struct firewall_ctx *ctx) {
         capture_stop(ctx->capture);
     }
     
-    /* Wait for threads to finish */
     pthread_join(ctx->capture_thread, NULL);
     pthread_join(ctx->cleanup_thread, NULL);
-    
-    printf("Firewall stopped\n");
 }
 
 void firewall_cleanup(struct firewall_ctx *ctx) {
@@ -231,10 +371,35 @@ void firewall_cleanup(struct firewall_ctx *ctx) {
     if (ctx->state) {
         state_cleanup(ctx->state);
     }
+    if (ctx->nat) {
+        nat_cleanup(ctx->nat);
+    }
     if (ctx->logger) {
         log_cleanup(ctx->logger);
     }
     
     free(ctx);
     g_ctx = NULL;
+}
+
+void firewall_add_nat_rule(struct firewall_ctx *ctx, int type, uint32_t src_ip, uint32_t src_mask,
+                          uint32_t dst_ip, uint32_t dst_mask, uint16_t src_port, uint16_t dst_port,
+                          int protocol, uint32_t nat_ip, uint16_t nat_port) {
+    if (!ctx || !ctx->nat) return;
+    
+    nat_add_rule(ctx->nat, type, src_ip, src_mask, dst_ip, dst_mask, 
+                src_port, dst_port, protocol, nat_ip, nat_port);
+}
+
+uint64_t firewall_get_stats(struct firewall_ctx *ctx, int stat_type) {
+    if (!ctx) return 0;
+    
+    switch (stat_type) {
+        case 0: return ctx->stats_total_packets;
+        case 1: return ctx->stats_dropped_packets;
+        case 2: return ctx->stats_rejected_packets;
+        case 3: return ctx->stats_injected_packets;
+        case 4: return ctx->stats_nat_packets;
+        default: return 0;
+    }
 }
