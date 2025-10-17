@@ -7,10 +7,12 @@
 #include "firewall.h"
 #include "capture/capture.h"
 #include "filter/filter.h"
+#include "state/state.h"
 
 static volatile int running = 1;
 static struct capture_ctx *capture_ctx = NULL;
 static struct filter_ctx *filter_ctx = NULL;
+static struct state_ctx *state_ctx = NULL;
 
 void sig_handler(int sig) {
     running = 0;
@@ -53,11 +55,18 @@ static int handle_packet(struct packet_info *pkt, void *user_data) {
     char src_ip[16], dst_ip[16];
     static uint64_t packet_count = 0;
     int action;
+    struct conn_entry *conn = NULL;
     
     packet_count++;
     
     inet_ntop(AF_INET, &pkt->src_ip, src_ip, sizeof(src_ip));
     inet_ntop(AF_INET, &pkt->dst_ip, dst_ip, sizeof(dst_ip));
+    
+    /* update connection tracking */
+    if (state_ctx) {
+        state_process_packet(state_ctx, pkt);
+        conn = state_find_connection(state_ctx, pkt);
+    }
     
     if (filter_ctx) {
         action = filter_packet(filter_ctx, pkt);
@@ -70,14 +79,25 @@ static int handle_packet(struct packet_info *pkt, void *user_data) {
             default: action_str = "UNKNOWN"; break;
         }
         
-        printf("[%lu] %s %s:%d -> %s:%d proto=%d len=%d [%s]\n",
+        const char *state_str = "NONE";
+        if (conn) {
+            switch (conn->state) {
+                case CONN_STATE_SYN_SENT: state_str = "SYN_SENT"; break;
+                case CONN_STATE_SYN_RECV: state_str = "SYN_RECV"; break;
+                case CONN_STATE_ESTABLISHED: state_str = "ESTABLISHED"; break;
+                case CONN_STATE_FIN_WAIT: state_str = "FIN_WAIT"; break;
+                default: state_str = "OTHER"; break;
+            }
+        }
+        
+        printf("[%lu] %s %s:%d -> %s:%d proto=%d len=%d [%s] state=%s\n",
                packet_count,
                protocol_str(pkt->protocol),
                src_ip, pkt->src_port,
                dst_ip, pkt->dst_port,
-               pkt->protocol, pkt->len, action_str);
+               pkt->protocol, pkt->len, action_str, state_str);
                
-        return action; /* return the action for potential packet dropping */
+        return action;
     } else {
         printf("[%lu] %s %s:%d -> %s:%d proto=%d len=%d\n",
                packet_count,
@@ -103,10 +123,18 @@ int main(int argc, char *argv[]) {
     
     print_banner();
     
+    /* init state tracking */
+    state_ctx = state_init(100000); /* 100k max connections */
+    if (!state_ctx) {
+        fprintf(stderr, "Failed to initialize state tracking\n");
+        return 1;
+    }
+    
     /* init filter engine */
     filter_ctx = filter_init();
     if (!filter_ctx) {
         fprintf(stderr, "Failed to initialize filter engine\n");
+        state_cleanup(state_ctx);
         return 1;
     }
     
@@ -117,6 +145,7 @@ int main(int argc, char *argv[]) {
     if (!ctx) {
         fprintf(stderr, "Failed to initialize firewall\n");
         filter_cleanup(filter_ctx);
+        state_cleanup(state_ctx);
         return 1;
     }
     
@@ -124,6 +153,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Failed to start firewall\n");
         firewall_cleanup(ctx);
         filter_cleanup(filter_ctx);
+        state_cleanup(state_ctx);
         return 1;
     }
     
@@ -133,6 +163,7 @@ int main(int argc, char *argv[]) {
         printf("Starting packet capture on %s...\n", iface);
         printf("Current rules:\n");
         filter_dump_rules(filter_ctx, RULE_DIR_IN);
+        printf("\nActive connections: %u\n", state_get_connection_count(state_ctx));
         printf("\n");
         capture_start(capture_ctx, handle_packet, NULL);
         capture_cleanup(capture_ctx);
@@ -143,6 +174,9 @@ int main(int argc, char *argv[]) {
     
     while (running) {
         sleep(1);
+        if (state_ctx) {
+            state_cleanup_old(state_ctx);
+        }
     }
     
     printf("\nFirewall statistics:\n");
@@ -150,11 +184,13 @@ int main(int argc, char *argv[]) {
     printf("Total bytes: %lu\n", filter_ctx->total_bytes);
     printf("Accepted: %lu\n", filter_ctx->accepted_packets);
     printf("Dropped: %lu\n", filter_ctx->dropped_packets);
+    printf("Active connections: %u\n", state_get_connection_count(state_ctx));
     
     printf("Shutting down firewall...\n");
     firewall_stop(ctx);
     firewall_cleanup(ctx);
     filter_cleanup(filter_ctx);
+    state_cleanup(state_ctx);
     
     return 0;
 }
