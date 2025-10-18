@@ -5,15 +5,18 @@ LDFLAGS = -lpthread -lm -lreadline
 SRCDIR = src
 OBJDIR = obj
 BINDIR = bin
+TESTDIR = tests
 
 SOURCES = $(wildcard $(SRCDIR)/*.c) \
           $(wildcard $(SRCDIR)/*/*.c)
 OBJECTS = $(SOURCES:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 TARGET = $(BINDIR)/firewall
+TEST_TARGET = $(BINDIR)/firewall_test
+INTEGRATION_TARGET = $(BINDIR)/integration_test
 
 INCLUDES = -Iinclude -I/usr/include
 
-.PHONY: all clean install uninstall
+.PHONY: all clean install uninstall test
 
 all: $(TARGET)
 
@@ -30,6 +33,16 @@ $(OBJDIR):
 $(BINDIR):
 	@mkdir -p $(BINDIR)
 
+test: $(TEST_TARGET) $(INTEGRATION_TARGET)
+
+$(TEST_TARGET): $(TESTDIR)/test_runner.c $(filter-out $(OBJDIR)/main.o, $(OBJECTS))
+	@mkdir -p $(BINDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS)
+
+$(INTEGRATION_TARGET): $(TESTDIR)/integration_test.c $(filter-out $(OBJDIR)/main.o, $(OBJECTS))
+	@mkdir -p $(BINDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS)
+
 clean:
 	rm -rf $(OBJDIR) $(BINDIR)
 
@@ -42,14 +55,13 @@ install: all
 uninstall:
 	rm -f /usr/local/bin/firewall
 
-debug: CFLAGS += -DDEBUG -Og
+debug: CFLAGS += -DDEBUG=1 -Og
 debug: all
 
 prod: CFLAGS += -O3 -DNDEBUG
 prod: all
 
-test: all
-	@echo "Testing firewall build..."
-	@sudo $(TARGET) --test 2>/dev/null || echo "Firewall test mode"
+check: test
+	./scripts/run_tests.sh
 
-.PHONY: all clean install uninstall debug prod test
+.PHONY: all clean install uninstall debug prod test check
