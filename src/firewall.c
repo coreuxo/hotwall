@@ -13,6 +13,8 @@
 #include "ids/ids.h"
 #include "qos/qos.h"
 #include "worker/worker.h"
+#include "monitor/monitor.h"
+#include "system/integration.h"
 #include "util/mempool.h"
 #include "log/log.h"
 
@@ -25,17 +27,20 @@ struct firewall_ctx {
     struct ids_ctx *ids;
     struct qos_ctx *qos;
     struct worker_pool *workers;
+    struct monitor_ctx *monitor;
     struct mempool *mempool;
     struct log_ctx *logger;
     
     pthread_t capture_thread;
     pthread_t cleanup_thread;
     pthread_t stats_thread;
+    pthread_t monitor_thread;
     
     volatile int running;
     char iface[16];
     uint32_t local_ip;
     int num_workers;
+    int daemon_mode;
     
     uint64_t stats_total_packets;
     uint64_t stats_dropped_packets;
@@ -179,15 +184,15 @@ static int firewall_packet_handler(struct packet_info *pkt, void *user_data) {
     direction = get_packet_direction(pkt, ctx->local_ip);
     pkt->direction = direction;
     
-    if (ctx->ids) {
-        ids_action = ids_process_packet(ctx->ids, pkt);
-        if (ids_action == IDS_ACTION_DROP) {
+    if (ctx->ids && ctx->ids->enabled) {
+        ids_action = ids_proc_pkt(ctx->ids, pkt);
+        if (ids_action == IDS_ACT_DROP) {
             ctx->stats_ids_alerts++;
             return 1;
         }
     }
     
-    if (ctx->qos) {
+    if (ctx->qos && ctx->qos->enabled) {
         qos_action = qos_process_packet(ctx->qos, pkt);
         if (qos_action == QOS_ACTION_DROP) {
             ctx->stats_qos_drops++;
@@ -285,9 +290,9 @@ static void *capture_thread_func(void *arg) {
         return NULL;
     }
     
-    printf("Packet capture running on %s with %d workers\n", ctx->iface, ctx->num_workers);
+    LOG("Packet capture running on %s with %d workers\n", ctx->iface, ctx->num_workers);
     capture_start(ctx->capture, capture_packet_handler, ctx);
-    printf("Packet capture stopped\n");
+    LOG("Packet capture stopped\n");
     
     return NULL;
 }
@@ -307,7 +312,7 @@ static void *cleanup_thread_func(void *arg) {
             nat_cleanup_old(ctx->nat);
         }
         if (ctx->ids) {
-            ids_cleanup_sessions(ctx->ids);
+            ids_clean_sess(ctx->ids);
         }
         if (ctx->qos) {
             qos_update_buckets(ctx->qos);
@@ -323,23 +328,50 @@ static void *cleanup_thread_func(void *arg) {
 
 static void *stats_thread_func(void *arg) {
     struct firewall_ctx *ctx = (struct firewall_ctx *)arg;
+    struct monitor_stats mstats;
+    double cpu_usage, memory_usage;
     
     if (!ctx) {
         return NULL;
     }
     
     while (ctx->running) {
-        sleep(10);
+        sleep(5);
         
         if (ctx->workers) {
             worker_pool_get_stats(ctx->workers, &ctx->stats_worker_packets, &ctx->stats_worker_bytes);
         }
         
-        printf("Firewall stats: total=%lu drop=%lu reject=%lu nat=%lu ids=%lu qos=%lu worker=%lu\n",
-               ctx->stats_total_packets, ctx->stats_dropped_packets,
-               ctx->stats_rejected_packets, ctx->stats_nat_packets,
-               ctx->stats_ids_alerts, ctx->stats_qos_drops,
-               ctx->stats_worker_packets);
+        memset(&mstats, 0, sizeof(mstats));
+        mstats.packets_total = ctx->stats_total_packets;
+        mstats.packets_dropped = ctx->stats_dropped_packets;
+        mstats.packets_accepted = ctx->stats_total_packets - ctx->stats_dropped_packets - ctx->stats_rejected_packets;
+        mstats.bytes_total = ctx->stats_worker_bytes;
+        mstats.connections_active = ctx->state ? state_get_connection_count(ctx->state) : 0;
+        mstats.ids_alerts = ctx->stats_ids_alerts;
+        mstats.nat_translations = ctx->stats_nat_packets;
+        mstats.qos_drops = ctx->stats_qos_drops;
+        mstats.queue_depth = ctx->stats_worker_packets;
+        
+        if (system_get_cpu_usage(&cpu_usage) == 0) {
+            mstats.cpu_usage = cpu_usage;
+        }
+        
+        if (system_get_memory_usage(&memory_usage) == 0) {
+            mstats.memory_usage = memory_usage;
+        }
+        
+        if (ctx->monitor) {
+            monitor_update_stats(ctx->monitor, &mstats);
+        }
+        
+        if (!ctx->daemon_mode) {
+            printf("Firewall stats: total=%lu drop=%lu reject=%lu nat=%lu ids=%lu qos=%lu worker=%lu cpu=%.1f%% mem=%.1f%%\n",
+                   ctx->stats_total_packets, ctx->stats_dropped_packets,
+                   ctx->stats_rejected_packets, ctx->stats_nat_packets,
+                   ctx->stats_ids_alerts, ctx->stats_qos_drops,
+                   ctx->stats_worker_packets, cpu_usage, memory_usage);
+        }
     }
     
     return NULL;
@@ -352,15 +384,16 @@ struct firewall_ctx *firewall_init(void) {
         return g_ctx;
     }
     
-    ctx = malloc(sizeof(struct firewall_ctx));
+    ctx = calloc(1, sizeof(struct firewall_ctx));
     if (!ctx) {
+        ERROR("Failed to allocate firewall context\n");
         return NULL;
     }
     
-    memset(ctx, 0, sizeof(struct firewall_ctx));
     strcpy(ctx->iface, "eth0");
     ctx->local_ip = inet_addr("192.168.1.100");
     ctx->num_workers = 4;
+    ctx->daemon_mode = 0;
     
     ctx->state = state_init(100000);
     ctx->filter = filter_init();
@@ -368,10 +401,12 @@ struct firewall_ctx *firewall_init(void) {
     ctx->ids = ids_init();
     ctx->qos = qos_init();
     ctx->workers = worker_pool_create(ctx->num_workers);
+    ctx->monitor = monitor_init();
     ctx->mempool = mempool_create();
     ctx->logger = log_init();
     
     if (!ctx->state || !ctx->filter || !ctx->workers) {
+        ERROR("Failed to initialize core components\n");
         firewall_cleanup(ctx);
         return NULL;
     }
@@ -379,6 +414,7 @@ struct firewall_ctx *firewall_init(void) {
     ctx->running = 0;
     g_ctx = ctx;
     
+    LOG("Firewall initialized successfully\n");
     return ctx;
 }
 
@@ -389,29 +425,43 @@ int firewall_start(struct firewall_ctx *ctx) {
         return -1;
     }
     
+    if (system_setup() != 0) {
+        ERROR("System setup failed\n");
+        return -1;
+    }
+    
+    if (system_write_pidfile() != 0) {
+        ERROR("Failed to write pid file\n");
+        return -1;
+    }
+    
     ctx->inject = inject_init(ctx->iface);
     ctx->capture = capture_init(ctx->iface, 1, 100);
     
     if (!ctx->capture) {
-        fprintf(stderr, "Failed to initialize packet capture\n");
+        ERROR("Failed to initialize packet capture on %s\n", ctx->iface);
         return -1;
     }
     
     if (!ctx->workers) {
-        fprintf(stderr, "Worker pool not initialized\n");
+        ERROR("Worker pool not initialized\n");
         return -1;
     }
     
     if (worker_pool_start(ctx->workers, firewall_packet_handler, ctx) != 0) {
-        fprintf(stderr, "Failed to start worker pool\n");
+        ERROR("Failed to start worker pool\n");
         return -1;
+    }
+    
+    if (ctx->monitor && monitor_start(ctx->monitor) != 0) {
+        ERROR("Failed to start monitor\n");
     }
     
     ctx->running = 1;
     
     ret = pthread_create(&ctx->capture_thread, NULL, capture_thread_func, ctx);
     if (ret != 0) {
-        fprintf(stderr, "Failed to create capture thread\n");
+        ERROR("Failed to create capture thread: %d\n", ret);
         ctx->running = 0;
         worker_pool_stop(ctx->workers);
         return -1;
@@ -419,7 +469,7 @@ int firewall_start(struct firewall_ctx *ctx) {
     
     ret = pthread_create(&ctx->cleanup_thread, NULL, cleanup_thread_func, ctx);
     if (ret != 0) {
-        fprintf(stderr, "Failed to create cleanup thread\n");
+        ERROR("Failed to create cleanup thread: %d\n", ret);
         ctx->running = 0;
         worker_pool_stop(ctx->workers);
         pthread_join(ctx->capture_thread, NULL);
@@ -428,7 +478,7 @@ int firewall_start(struct firewall_ctx *ctx) {
     
     ret = pthread_create(&ctx->stats_thread, NULL, stats_thread_func, ctx);
     if (ret != 0) {
-        fprintf(stderr, "Failed to create stats thread\n");
+        ERROR("Failed to create stats thread: %d\n", ret);
         ctx->running = 0;
         worker_pool_stop(ctx->workers);
         pthread_join(ctx->capture_thread, NULL);
@@ -436,7 +486,7 @@ int firewall_start(struct firewall_ctx *ctx) {
         return -1;
     }
     
-    printf("Firewall engine started with %d workers, IDS, and QoS\n", ctx->num_workers);
+    LOG("Firewall engine started with %d workers, IDS, QoS, and monitoring\n", ctx->num_workers);
     return 0;
 }
 
@@ -453,9 +503,15 @@ void firewall_stop(struct firewall_ctx *ctx) {
         worker_pool_stop(ctx->workers);
     }
     
+    if (ctx->monitor) {
+        monitor_stop(ctx->monitor);
+    }
+    
     pthread_join(ctx->capture_thread, NULL);
     pthread_join(ctx->cleanup_thread, NULL);
     pthread_join(ctx->stats_thread, NULL);
+    
+    system_cleanup();
 }
 
 void firewall_cleanup(struct firewall_ctx *ctx) {
@@ -487,6 +543,9 @@ void firewall_cleanup(struct firewall_ctx *ctx) {
     if (ctx->workers) {
         worker_pool_destroy(ctx->workers);
     }
+    if (ctx->monitor) {
+        monitor_cleanup(ctx->monitor);
+    }
     if (ctx->mempool) {
         mempool_destroy(ctx->mempool);
     }
@@ -496,6 +555,8 @@ void firewall_cleanup(struct firewall_ctx *ctx) {
     
     free(ctx);
     g_ctx = NULL;
+    
+    LOG("Firewall cleanup complete\n");
 }
 
 void firewall_add_nat_rule(struct firewall_ctx *ctx, int type, uint32_t src_ip, uint32_t src_mask,
@@ -522,4 +583,10 @@ uint64_t firewall_get_stats(struct firewall_ctx *ctx, int stat_type) {
         case 8: return ctx->stats_qos_drops;
         default: return 0;
     }
+}
+
+int firewall_set_daemon_mode(struct firewall_ctx *ctx, int enable) {
+    if (!ctx) return -1;
+    ctx->daemon_mode = enable;
+    return 0;
 }

@@ -19,5 +19,6 @@ void firewall_add_nat_rule(struct firewall_ctx *ctx, int type, uint32_t src_ip, 
                           uint32_t dst_ip, uint32_t dst_mask, uint16_t src_port, uint16_t dst_port,
                           int protocol, uint32_t nat_ip, uint16_t nat_port);
 uint64_t firewall_get_stats(struct firewall_ctx *ctx, int stat_type);
+int firewall_set_daemon_mode(struct firewall_ctx *ctx, int enable);
 
 #endif
