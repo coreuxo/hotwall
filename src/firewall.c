@@ -10,6 +10,8 @@
 #include "filter/filter.h"
 #include "state/state.h"
 #include "nat/nat.h"
+#include "worker/worker.h"
+#include "util/mempool.h"
 #include "log/log.h"
 
 struct firewall_ctx {
@@ -18,20 +20,26 @@ struct firewall_ctx {
     struct filter_ctx *filter;
     struct state_ctx *state;
     struct nat_ctx *nat;
+    struct worker_pool *workers;
+    struct mempool *mempool;
     struct log_ctx *logger;
     
     pthread_t capture_thread;
     pthread_t cleanup_thread;
+    pthread_t stats_thread;
     
     volatile int running;
     char iface[16];
     uint32_t local_ip;
+    int num_workers;
     
     uint64_t stats_total_packets;
     uint64_t stats_dropped_packets;
     uint64_t stats_rejected_packets;
     uint64_t stats_injected_packets;
     uint64_t stats_nat_packets;
+    uint64_t stats_worker_packets;
+    uint64_t stats_worker_bytes;
 };
 
 static struct firewall_ctx *g_ctx = NULL;
@@ -189,14 +197,6 @@ static int firewall_packet_handler(struct packet_info *pkt, void *user_data) {
             
         case RULE_ACTION_DROP:
             ctx->stats_dropped_packets++;
-            if (ctx->logger) {
-                char src_ip[16], dst_ip[16];
-                inet_ntop(AF_INET, &pkt->src_ip, src_ip, sizeof(src_ip));
-                inet_ntop(AF_INET, &pkt->dst_ip, dst_ip, sizeof(dst_ip));
-                log_msg(ctx->logger, LOG_LEVEL_INFO, "DROP %s %s:%d -> %s:%d proto=%d",
-                       protocol_str(pkt->protocol), src_ip, pkt->src_port, 
-                       dst_ip, pkt->dst_port, pkt->protocol);
-            }
             return 1;
             
         case RULE_ACTION_REJECT:
@@ -214,26 +214,41 @@ static int firewall_packet_handler(struct packet_info *pkt, void *user_data) {
                     ctx->stats_injected_packets++;
                 }
             }
-            if (ctx->logger) {
-                char src_ip[16], dst_ip[16];
-                inet_ntop(AF_INET, &pkt->src_ip, src_ip, sizeof(src_ip));
-                inet_ntop(AF_INET, &pkt->dst_ip, dst_ip, sizeof(dst_ip));
-                log_msg(ctx->logger, LOG_LEVEL_INFO, "REJECT %s %s:%d -> %s:%d proto=%d",
-                       protocol_str(pkt->protocol), src_ip, pkt->src_port,
-                       dst_ip, pkt->dst_port, pkt->protocol);
-            }
             return 1;
             
         case RULE_ACTION_LOG:
-            if (ctx->logger) {
-                char src_ip[16], dst_ip[16];
-                inet_ntop(AF_INET, &pkt->src_ip, src_ip, sizeof(src_ip));
-                inet_ntop(AF_INET, &pkt->dst_ip, dst_ip, sizeof(dst_ip));
-                log_msg(ctx->logger, LOG_LEVEL_INFO, "LOG %s %s:%d -> %s:%d proto=%d len=%d",
-                       protocol_str(pkt->protocol), src_ip, pkt->src_port,
-                       dst_ip, pkt->dst_port, pkt->protocol, pkt->len);
-            }
             break;
+    }
+    
+    return 0;
+}
+
+static int capture_packet_handler(struct packet_info *pkt, void *user_data) {
+    struct firewall_ctx *ctx = (struct firewall_ctx *)user_data;
+    struct packet_info *worker_pkt;
+    
+    if (!ctx || !pkt || !ctx->workers) {
+        return 0;
+    }
+    
+    worker_pkt = malloc(sizeof(struct packet_info));
+    if (!worker_pkt) {
+        return 0;
+    }
+    
+    memcpy(worker_pkt, pkt, sizeof(struct packet_info));
+    
+    worker_pkt->data = malloc(pkt->len);
+    if (!worker_pkt->data) {
+        free(worker_pkt);
+        return 0;
+    }
+    
+    memcpy(worker_pkt->data, pkt->data, pkt->len);
+    
+    if (worker_pool_submit_packet(ctx->workers, worker_pkt) != 0) {
+        free(worker_pkt->data);
+        free(worker_pkt);
     }
     
     return 0;
@@ -246,8 +261,8 @@ static void *capture_thread_func(void *arg) {
         return NULL;
     }
     
-    printf("Packet capture running on %s\n", ctx->iface);
-    capture_start(ctx->capture, firewall_packet_handler, ctx);
+    printf("Packet capture running on %s with %d workers\n", ctx->iface, ctx->num_workers);
+    capture_start(ctx->capture, capture_packet_handler, ctx);
     printf("Packet capture stopped\n");
     
     return NULL;
@@ -267,7 +282,33 @@ static void *cleanup_thread_func(void *arg) {
         if (ctx->nat) {
             nat_cleanup_old(ctx->nat);
         }
+        if (ctx->mempool) {
+            mempool_reset(ctx->mempool);
+        }
         sleep(60);
+    }
+    
+    return NULL;
+}
+
+static void *stats_thread_func(void *arg) {
+    struct firewall_ctx *ctx = (struct firewall_ctx *)arg;
+    
+    if (!ctx) {
+        return NULL;
+    }
+    
+    while (ctx->running) {
+        sleep(10);
+        
+        if (ctx->workers) {
+            worker_pool_get_stats(ctx->workers, &ctx->stats_worker_packets, &ctx->stats_worker_bytes);
+        }
+        
+        printf("Firewall stats: total=%lu drop=%lu reject=%lu nat=%lu worker=%lu\n",
+               ctx->stats_total_packets, ctx->stats_dropped_packets,
+               ctx->stats_rejected_packets, ctx->stats_nat_packets,
+               ctx->stats_worker_packets);
     }
     
     return NULL;
@@ -288,13 +329,16 @@ struct firewall_ctx *firewall_init(void) {
     memset(ctx, 0, sizeof(struct firewall_ctx));
     strcpy(ctx->iface, "eth0");
     ctx->local_ip = inet_addr("192.168.1.100");
+    ctx->num_workers = 4;
     
     ctx->state = state_init(100000);
     ctx->filter = filter_init();
     ctx->nat = nat_init(inet_addr("1.2.3.4"));
+    ctx->workers = worker_pool_create(ctx->num_workers);
+    ctx->mempool = mempool_create();
     ctx->logger = log_init();
     
-    if (!ctx->state || !ctx->filter) {
+    if (!ctx->state || !ctx->filter || !ctx->workers) {
         firewall_cleanup(ctx);
         return NULL;
     }
@@ -320,12 +364,23 @@ int firewall_start(struct firewall_ctx *ctx) {
         return -1;
     }
     
+    if (!ctx->workers) {
+        fprintf(stderr, "Worker pool not initialized\n");
+        return -1;
+    }
+    
+    if (worker_pool_start(ctx->workers, firewall_packet_handler, ctx) != 0) {
+        fprintf(stderr, "Failed to start worker pool\n");
+        return -1;
+    }
+    
     ctx->running = 1;
     
     ret = pthread_create(&ctx->capture_thread, NULL, capture_thread_func, ctx);
     if (ret != 0) {
         fprintf(stderr, "Failed to create capture thread\n");
         ctx->running = 0;
+        worker_pool_stop(ctx->workers);
         return -1;
     }
     
@@ -333,11 +388,22 @@ int firewall_start(struct firewall_ctx *ctx) {
     if (ret != 0) {
         fprintf(stderr, "Failed to create cleanup thread\n");
         ctx->running = 0;
+        worker_pool_stop(ctx->workers);
         pthread_join(ctx->capture_thread, NULL);
         return -1;
     }
     
-    printf("Firewall engine started\n");
+    ret = pthread_create(&ctx->stats_thread, NULL, stats_thread_func, ctx);
+    if (ret != 0) {
+        fprintf(stderr, "Failed to create stats thread\n");
+        ctx->running = 0;
+        worker_pool_stop(ctx->workers);
+        pthread_join(ctx->capture_thread, NULL);
+        pthread_join(ctx->cleanup_thread, NULL);
+        return -1;
+    }
+    
+    printf("Firewall engine started with %d workers\n", ctx->num_workers);
     return 0;
 }
 
@@ -350,8 +416,13 @@ void firewall_stop(struct firewall_ctx *ctx) {
         capture_stop(ctx->capture);
     }
     
+    if (ctx->workers) {
+        worker_pool_stop(ctx->workers);
+    }
+    
     pthread_join(ctx->capture_thread, NULL);
     pthread_join(ctx->cleanup_thread, NULL);
+    pthread_join(ctx->stats_thread, NULL);
 }
 
 void firewall_cleanup(struct firewall_ctx *ctx) {
@@ -373,6 +444,12 @@ void firewall_cleanup(struct firewall_ctx *ctx) {
     }
     if (ctx->nat) {
         nat_cleanup(ctx->nat);
+    }
+    if (ctx->workers) {
+        worker_pool_destroy(ctx->workers);
+    }
+    if (ctx->mempool) {
+        mempool_destroy(ctx->mempool);
     }
     if (ctx->logger) {
         log_cleanup(ctx->logger);
@@ -400,6 +477,8 @@ uint64_t firewall_get_stats(struct firewall_ctx *ctx, int stat_type) {
         case 2: return ctx->stats_rejected_packets;
         case 3: return ctx->stats_injected_packets;
         case 4: return ctx->stats_nat_packets;
+        case 5: return ctx->stats_worker_packets;
+        case 6: return ctx->stats_worker_bytes;
         default: return 0;
     }
 }
