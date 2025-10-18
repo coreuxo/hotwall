@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -g -std=gnu99 -pthread
-LDFLAGS = -lpthread -lm
+LDFLAGS = -lpthread -lm -lreadline
 
 SRCDIR = src
 OBJDIR = obj
@@ -13,7 +13,7 @@ TARGET = $(BINDIR)/firewall
 
 INCLUDES = -Iinclude -I/usr/include
 
-.PHONY: all clean install uninstall nat
+.PHONY: all clean install uninstall nat cli
 
 all: $(TARGET)
 
@@ -46,6 +46,9 @@ debug: all
 nat: CFLAGS += -DNAT_ENABLED
 nat: all
 
+cli: LDFLAGS += -lreadline
+cli: all
+
 test: all
 	@echo "Testing firewall build..."
 	@sudo $(TARGET) --test 2>/dev/null || echo "Firewall test mode"
@@ -54,4 +57,4 @@ rules:
 	@chmod +x scripts/setup_rules.sh
 	@./scripts/setup_rules.sh
 
-.PHONY: all clean install uninstall debug nat test rules
+.PHONY: all clean install uninstall debug nat cli test rules
