@@ -13,7 +13,7 @@ TARGET = $(BINDIR)/firewall
 
 INCLUDES = -Iinclude -I/usr/include
 
-.PHONY: all clean install uninstall nat cli
+.PHONY: all clean install uninstall
 
 all: $(TARGET)
 
@@ -36,6 +36,8 @@ clean:
 install: all
 	cp $(TARGET) /usr/local/bin/
 	chmod +x /usr/local/bin/firewall
+	mkdir -p /etc/firewall
+	cp config/firewall.conf /etc/firewall/
 
 uninstall:
 	rm -f /usr/local/bin/firewall
@@ -43,18 +45,11 @@ uninstall:
 debug: CFLAGS += -DDEBUG -Og
 debug: all
 
-nat: CFLAGS += -DNAT_ENABLED
-nat: all
-
-cli: LDFLAGS += -lreadline
-cli: all
+prod: CFLAGS += -O3 -DNDEBUG
+prod: all
 
 test: all
 	@echo "Testing firewall build..."
 	@sudo $(TARGET) --test 2>/dev/null || echo "Firewall test mode"
 
-rules:
-	@chmod +x scripts/setup_rules.sh
-	@./scripts/setup_rules.sh
-
-.PHONY: all clean install uninstall debug nat cli test rules
+.PHONY: all clean install uninstall debug prod test
