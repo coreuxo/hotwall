@@ -10,6 +10,8 @@
 #include "filter/filter.h"
 #include "state/state.h"
 #include "nat/nat.h"
+#include "ids/ids.h"
+#include "qos/qos.h"
 #include "worker/worker.h"
 #include "util/mempool.h"
 #include "log/log.h"
@@ -20,6 +22,8 @@ struct firewall_ctx {
     struct filter_ctx *filter;
     struct state_ctx *state;
     struct nat_ctx *nat;
+    struct ids_ctx *ids;
+    struct qos_ctx *qos;
     struct worker_pool *workers;
     struct mempool *mempool;
     struct log_ctx *logger;
@@ -40,6 +44,8 @@ struct firewall_ctx {
     uint64_t stats_nat_packets;
     uint64_t stats_worker_packets;
     uint64_t stats_worker_bytes;
+    uint64_t stats_ids_alerts;
+    uint64_t stats_qos_drops;
 };
 
 static struct firewall_ctx *g_ctx = NULL;
@@ -163,6 +169,8 @@ static int firewall_packet_handler(struct packet_info *pkt, void *user_data) {
     int action = RULE_ACTION_ACCEPT;
     int direction;
     int nat_applied = 0;
+    int ids_action = IDS_ACTION_ALERT;
+    int qos_action = QOS_ACTION_PASS;
     
     if (!ctx || !pkt) return 1;
     
@@ -170,6 +178,22 @@ static int firewall_packet_handler(struct packet_info *pkt, void *user_data) {
     
     direction = get_packet_direction(pkt, ctx->local_ip);
     pkt->direction = direction;
+    
+    if (ctx->ids) {
+        ids_action = ids_process_packet(ctx->ids, pkt);
+        if (ids_action == IDS_ACTION_DROP) {
+            ctx->stats_ids_alerts++;
+            return 1;
+        }
+    }
+    
+    if (ctx->qos) {
+        qos_action = qos_process_packet(ctx->qos, pkt);
+        if (qos_action == QOS_ACTION_DROP) {
+            ctx->stats_qos_drops++;
+            return 1;
+        }
+    }
     
     if (ctx->nat) {
         nat_applied = nat_process_packet(ctx->nat, pkt, direction);
@@ -282,6 +306,12 @@ static void *cleanup_thread_func(void *arg) {
         if (ctx->nat) {
             nat_cleanup_old(ctx->nat);
         }
+        if (ctx->ids) {
+            ids_cleanup_sessions(ctx->ids);
+        }
+        if (ctx->qos) {
+            qos_update_buckets(ctx->qos);
+        }
         if (ctx->mempool) {
             mempool_reset(ctx->mempool);
         }
@@ -305,9 +335,10 @@ static void *stats_thread_func(void *arg) {
             worker_pool_get_stats(ctx->workers, &ctx->stats_worker_packets, &ctx->stats_worker_bytes);
         }
         
-        printf("Firewall stats: total=%lu drop=%lu reject=%lu nat=%lu worker=%lu\n",
+        printf("Firewall stats: total=%lu drop=%lu reject=%lu nat=%lu ids=%lu qos=%lu worker=%lu\n",
                ctx->stats_total_packets, ctx->stats_dropped_packets,
                ctx->stats_rejected_packets, ctx->stats_nat_packets,
+               ctx->stats_ids_alerts, ctx->stats_qos_drops,
                ctx->stats_worker_packets);
     }
     
@@ -334,6 +365,8 @@ struct firewall_ctx *firewall_init(void) {
     ctx->state = state_init(100000);
     ctx->filter = filter_init();
     ctx->nat = nat_init(inet_addr("1.2.3.4"));
+    ctx->ids = ids_init();
+    ctx->qos = qos_init();
     ctx->workers = worker_pool_create(ctx->num_workers);
     ctx->mempool = mempool_create();
     ctx->logger = log_init();
@@ -403,7 +436,7 @@ int firewall_start(struct firewall_ctx *ctx) {
         return -1;
     }
     
-    printf("Firewall engine started with %d workers\n", ctx->num_workers);
+    printf("Firewall engine started with %d workers, IDS, and QoS\n", ctx->num_workers);
     return 0;
 }
 
@@ -445,6 +478,12 @@ void firewall_cleanup(struct firewall_ctx *ctx) {
     if (ctx->nat) {
         nat_cleanup(ctx->nat);
     }
+    if (ctx->ids) {
+        ids_cleanup(ctx->ids);
+    }
+    if (ctx->qos) {
+        qos_cleanup(ctx->qos);
+    }
     if (ctx->workers) {
         worker_pool_destroy(ctx->workers);
     }
@@ -479,6 +518,8 @@ uint64_t firewall_get_stats(struct firewall_ctx *ctx, int stat_type) {
         case 4: return ctx->stats_nat_packets;
         case 5: return ctx->stats_worker_packets;
         case 6: return ctx->stats_worker_bytes;
+        case 7: return ctx->stats_ids_alerts;
+        case 8: return ctx->stats_qos_drops;
         default: return 0;
     }
 }
